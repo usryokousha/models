@@ -1,0 +1,312 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.python.keras import layers
+from tensorflow.python.keras import backend
+
+from typing import Callable, Optional, Tuple
+
+from tensorflow.python.ops.gen_array_ops import transpose
+from tensorflow.python.ops.gen_batch_ops import batch
+
+
+class RelativePositionEmbedding(layers.Layer):
+    def __init__(self, patch_embed_shape: tuple, initializer: object, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._patch_embed_shape = patch_embed_shape
+        self._initializer = initializer
+        self._include_class_embed = include_class_embed
+
+    def call(self, query, **kwargs):
+        height_embed = tf.tile(tf.repeat(
+            self.pos_height,
+            self._patch_embed_shape[2],
+            axis=1
+        ), [1, self._patch_embed_shape[0], 1])
+        width_embed = tf.tile(
+            self.pos_width,
+            [1, np.prod(self._patch_embed_shape[:2]), 1]
+        )
+        temporal_embed = tf.repeat(
+            self.pos_temporal,
+            np.prod(self._patch_embed_shape[-2:]),
+            axis=1
+        )
+
+        pos_embed = temporal_embed + height_embed + width_embed
+
+        return tf.matmul(query, pos_embed, transpose_b=True)
+
+    def build(self, input_shape):
+        embed_dim = input_shape[-1]
+
+        self.pos_height = self.add_weight(
+            name="height_embedding",
+            shape=[1, self._patch_embed_shape[1], embed_dim],
+            initializer=self._initializer
+        )
+        self.pos_width = self.add_weight(
+            name="width_embedding",
+            shape=[1, self._patch_embed_shape[2], embed_dim],
+            initializer=self._initializer
+        )
+        self.pos_temporal = self.add_weight(
+            name="temporal_embedding",
+            shape=[1, self._patch_embed_shape[0], embed_dim],
+            initializer=self._initializer
+        )
+
+        return super().build(input_shape)
+
+    @property
+    def patch_embed_shape(self):
+        return self._patch_embed_shape
+
+
+def _attention_pooling(
+    tensor: tf.Tensor,
+    pooling: Callable,
+    patch_shape: tf.TensorShape,
+    norm: Optional[Callable]
+):
+    if pooling is None:
+        return tensor, patch_shape
+
+    input_rank = tensor.shape.rank
+    if input_rank == 3:
+        tensor = tf.expand_dims(tensor, axis=1)
+
+    batch, num_heads, length, channels = tensor.shape
+    frames, height, width = patch_shape
+
+    tensor = tf.reshape(tensor,
+                        [batch * num_heads, frames, height, width, channels])
+
+    if backend.image_data_format() == 'channels_first':
+        tensor = tf.transpose(tensor, perm=[0, 4, 1, 2, 3])
+
+    tensor = pooling(tensor)
+
+    if backend.image_data_format() == 'channels_first':
+        output_patch_shape = tensor.shape[2:]
+        length_pooled = np.prod(output_patch_shape)
+        tensor = tensor.reshape(tensor,
+                                [batch, num_heads, channels, length_pooled])
+        tensor = tf.transpose(tensor, perm=[0, 1, 3, 2])
+    else:
+        output_patch_shape = tensor.shape[1:-2]
+        length_pooled = np.prod(output_patch_shape)
+        tensor = tensor.reshape(tensor,
+                                [batch, num_heads, length_pooled, channels])
+
+    if norm is not None:
+        tensor = norm(tensor)
+
+    if input_rank == 3:
+        tensor = tf.squeeze(tensor, axis=1)
+
+    return tensor, output_patch_shape
+
+
+class MultiscaleAttention(layers.Layer):
+    def __init__(
+            self,
+            patch_embed_shape: tuple,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            dropout_rate: float = 0.0,
+            kernel_q: Tuple[int] = (1, 1, 1),
+            kernel_kv: Tuple[int] = (1, 1, 1),
+            stride_q: Tuple[int] = (1, 1, 1),
+            stride_kv: Tuple[int] = (1, 1, 1),
+            norm_epsilon: float = 1e-6,
+            pool_mode: str = 'conv',
+            pool_first: bool = False,
+            embed_initializer="zeros",
+            kernel_initializer="glorot_uniform",
+            bias_initializer="zeros",
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            **kwargs):
+        super().__init__(**kwargs)
+        assert pool_mode in ["conv", "avg", "max"], "Selection is not valid."
+        self._patch_embed_shape = patch_embed_shape
+        self._kernel_q = kernel_q
+        self._kernel_kv = kernel_kv
+        self._stride_q = stride_q
+        self._stride_kv = stride_kv
+        self._qkv_bias = qkv_bias
+        self._pool_first = pool_first
+        self._dropout_rate = dropout_rate
+        self._num_heads = num_heads
+        self._norm_epsilon = norm_epsilon
+        self._embed_initializer = tf.keras.initializers.get(
+            embed_initializer)
+        self._kernel_initializer = tf.keras.initializers.get(
+            kernel_initializer)
+        self._bias_initializer = tf.keras.initializers.get(bias_initializer)
+        self._kernel_regularizer = tf.keras.regularizers.get(
+            kernel_regularizer)
+        self._bias_regularizer = tf.keras.regularizers.get(bias_regularizer)
+
+    def build(self, input_shape):
+        batch, num_tokens, embed_dim = input_shape
+
+        common_kwargs = dict(
+            kernel_initializer=self._kernel_initializer,
+            bias_initializer=self._bias_initializer,
+            kernel_regularizer=self._kernel_regularizer,
+            bias_regularizer=self._bias_regularizer)
+
+        head_dim = input_shape[-1] // self._num_heads
+        self._scale = head_dim ** -0.5
+
+        padding_q = [int(q // 2) for q in self._kernel_q]
+        padding_kv = [int(kv // 2) for kv in self._kernel_kv]
+
+        self.proj_q = layers.Dense(
+            embed_dim, use_bias=self._qkv_bias, **common_kwargs)
+        self.proj_k = layers.Dense(
+            embed_dim, use_bias=self._qkv_bias, **common_kwargs)
+        self.proj_v = layers.Dense(
+            embed_dim, use_bias=self._qkv_bias, **common_kwargs)
+        self.proj_output = layers.Dense(
+            embed_dim, use_bias=True, **common_kwargs)
+
+        if self._dropout_rate > 0.0:
+            self.proj_drop = layers.Dropout(self._dropout_rate)
+
+        self.norm = layers.LayerNormalization(
+                self._norm_epsilon)
+
+        # Skip pooling with kernel and stride size of (1, 1, 1).
+        if (
+            self._kernel_q is not None
+            and np.prod(self._kernel_q) == 1
+            and np.prod(self._stride_q) == 1
+        ):
+            self._kernel_q = None
+        if (
+            self._kernel_kv is not None
+            and np.prod(self._kernel_kv) == 1
+            and np.prod(self._stride_kv) == 1
+        ):
+            self._kernel_kv = None
+
+        if self._pool_mode in ["avg", "max"]:
+            pool_op = layers.MaxPooling3D if self._pool_mode == "max" else layers.AveragePooling3D
+            self.pool_q = pool_op(self._kernel_q,
+                                  self._stride_q,
+                                  padding='VALID') \
+                if self._kernel_q is not None \
+                else None
+            self.pool_k = pool_op(self._kernel_kv,
+                                  self._stride_kv,
+                                  padding='VALID') \
+                if self._kernel_kv is not None \
+                else None
+            self.pool_v = pool_op(self._kernel_kv,
+                                  self._stride_kv,
+                                  padding='VALID') \
+                if self._kernel_kv is not None \
+                else None
+        elif self._pool_mode == 'conv':
+            self.pool_q = (
+                layers.Conv3D(
+                    self._kernel_q,
+                    strides=self._stride_q,
+                    padding='VALID',
+                    groups=head_dim,
+                    use_bias=False,
+                    **common_kwargs
+                )
+                if self._kernel_q is not None
+                else None
+            )
+    
+            self.pool_k = (
+                layers.Conv3D(
+                    self._kernel_kv,
+                    strides=self._stride_kv,
+                    padding='VALID',
+                    groups=head_dim,
+                    use_bias=False,
+                    **common_kwargs
+                )
+                if self._kernel_kv is not None
+                else None
+            )
+         
+            self.pool_q = (
+                layers.Conv3D(
+                    self._kernel_q,
+                    strides=self._stride_q,
+                    padding='VALID',
+                    groups=head_dim,
+                    use_bias=False,
+                    **common_kwargs
+                )
+                if self._kernel_q is not None
+                else None
+            )
+           
+        else:
+            raise NotImplementedError(f"Unsupported model {self._pool_mode}")
+
+        self.pos_embed = RelativePositionEmbedding(
+            patch_embed_shape=self._patch_embed_shape,
+
+        )
+        return super().build(input_shape)
+
+    def call(self, inputs: tf.Tensor, patch_shape: tf.TensorShape):
+        batch, channels = inputs.shape[0], inputs.shape[-1]
+        x = self.norm(inputs)
+        q = self.proj_q(x)
+        k = self.proj_k(x)
+        v = self.proj_v(x)
+
+        res, _ = _attention_pooling(inputs, self.pool_q, patch_shape)
+        q_pool, q_shape = _attention_pooling(q, self.pool_q, patch_shape)
+        k_pool, _ = _attention_pooling(k, self.pool_k, patch_shape)
+        v_pool, _ = _attention_pooling(v, self.pool_v, patch_shape)
+
+        pos_rel_embed = self.pos_embed(q_pool)
+        attn = tf.matmul(q_pool, tf.transpose(k_pool, [0, 1, 3, 2]))
+        attn = attn + pos_rel_embed
+        attn = tf.nn.softmax(attn, axis=-1)
+
+        x = tf.matmul(attn, v_pool)
+        x = tf.transpose(x, perm=[0, 2, 1])
+        x = tf.reshape(x, [batch, q_pool.shape[2], channels])
+        x = x + q_pool
+
+        x = self.proj_output(x)
+        if self._dropout_rate > 0.0:
+            x = self.proj_drop(x)
+        x = x + res
+        return x, q_shape
+
+
+
+
+
+
+        
+
+
+def _reshape_to_seq(
+    tensor: tf.Tensor,
+    length: int,
+    batch: int,
+    channels: int,
+) -> Tuple[int]:
+    if backend.image_data_format() == 'channels_first':
+        tensor = tf.transpose(tensor, perm=[0, 2, 1, 3])
+    tensor = tf.reshape(tensor, [batch, length, channels])
+    return tensor
+
+
+def _get_length(
+    tensor_shape: tf.TensorShape
+) -> int:
+    return np.prod(tensor_shape)
