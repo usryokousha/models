@@ -5,6 +5,8 @@ from tensorflow.python.keras import backend
 
 from typing import Callable, Optional, Tuple, List
 
+from tensorflow.python.keras.engine.base_layer import Layer
+
 from official.vision.beta.modeling.layers.nn_layers import StochasticDepth
 
 
@@ -14,28 +16,28 @@ class RelativePositionEmbedding(layers.Layer):
         self._initializer = initializer
 
     def build(self, input_shape):
-        batch, time, height, width, channels = input_shape
+        _, _, time, height, width, channels = input_shape
 
         self.pos_height = self.add_weight(
             name="height_embedding",
-            shape=[1, height, channels],
+            shape=[1, 1, height, channels],
             initializer=self._initializer
         )
         self.pos_width = self.add_weight(
             name="width_embedding",
-            shape=[1, width, channels],
+            shape=[1, 1, width, channels],
             initializer=self._initializer
         )
         self.pos_temporal = self.add_weight(
             name="temporal_embedding",
-            shape=[1, time, channels],
+            shape=[1, 1, time, channels],
             initializer=self._initializer
         )
 
         return super().build(input_shape)
 
-    def call(self, inputs, **kwargs):
-        batch, time, height, width, channels = inputs.shape
+    def call(self, inputs):
+        _, num_heads, time, height, width, channels = inputs.shape
         length = time * height * width
         height_embed = tf.tile(tf.repeat(
             self.pos_height,
@@ -54,8 +56,8 @@ class RelativePositionEmbedding(layers.Layer):
 
         pos_embed = temporal_embed + height_embed + width_embed
 
-        return tf.matmul(tf.reshape(inputs, [-1, length, channels]),
-                         tf.transpose(pos_embed, perm=[0, 2, 1]))
+        return tf.add(tf.reshape(inputs, [-1, num_heads, length, channels]),
+                      pos_embed)
 
     def get_input_shape_at(self, node_index):
         return super().get_input_shape_at(node_index)
@@ -78,28 +80,28 @@ def _attention_pooling(
     if input_rank == 3:
         tensor = tf.expand_dims(tensor, axis=1)
 
-    batch, num_heads, length, channels = tensor.shape
+    _, num_heads, _, channels = tensor.shape
     frames, height, width = patch_shape
 
     tensor = tf.reshape(tensor,
-                        [batch * num_heads, frames, height, width, channels])
+                        [-1, frames, height, width, channels])
 
-    if backend.image_data_format() == 'channels_first':
+    if tf.keras.backend.image_data_format() == 'channels_first':
         tensor = tf.transpose(tensor, perm=[0, 4, 1, 2, 3])
 
     tensor = pooling(tensor)
 
-    if backend.image_data_format() == 'channels_first':
+    if tf.keras.backend.image_data_format() == 'channels_first':
         output_patch_shape = tensor.shape[2:]
         length_pooled = np.prod(output_patch_shape)
         tensor = tensor.reshape(tensor,
-                                [batch, num_heads, channels, length_pooled])
+                                [-1, num_heads, channels, length_pooled])
         tensor = tf.transpose(tensor, perm=[0, 1, 3, 2])
     else:
         output_patch_shape = tensor.shape[1:-2]
         length_pooled = np.prod(output_patch_shape)
         tensor = tensor.reshape(tensor,
-                                [batch, num_heads, length_pooled, channels])
+                                [-1, num_heads, length_pooled, channels])
 
     if norm is not None:
         tensor = norm(tensor)
@@ -149,6 +151,7 @@ class MultiscaleAttention(layers.Layer):
     def build(self, input_shape):
         _, _, embed_dim = input_shape
 
+        data_format = tf.keras.backend.image_data_format()
         common_kwargs = dict(
             kernel_initializer=self._kernel_initializer,
             bias_initializer=self._bias_initializer,
@@ -188,17 +191,20 @@ class MultiscaleAttention(layers.Layer):
             pool_op = layers.MaxPooling3D if self._pool_mode == "max" else layers.AveragePooling3D
             self.pool_q = pool_op(self._kernel_q,
                                   strides=self._stride_q,
-                                  padding='VALID') \
+                                  padding='VALID',
+                                  data_format=data_format) \
                 if self._kernel_q is not None \
                 else None
             self.pool_k = pool_op(self._kernel_kv,
                                   self._stride_kv,
-                                  padding='VALID') \
+                                  padding='VALID',
+                                  data_format=data_format) \
                 if self._kernel_kv is not None \
                 else None
             self.pool_v = pool_op(self._kernel_kv,
                                   strides=self._stride_kv,
-                                  padding='VALID') \
+                                  padding='VALID',
+                                  data_format=data_format) \
                 if self._kernel_kv is not None \
                 else None
         elif self._pool_mode == 'conv':
@@ -210,6 +216,7 @@ class MultiscaleAttention(layers.Layer):
                     padding='VALID',
                     groups=head_dim,
                     use_bias=False,
+                    data_format=data_format,
                     **common_kwargs
                 )
                 if self._kernel_q is not None
@@ -224,6 +231,7 @@ class MultiscaleAttention(layers.Layer):
                     padding='VALID',
                     groups=head_dim,
                     use_bias=False,
+                    data_format=data_format,
                     **common_kwargs
                 )
                 if self._kernel_kv is not None
@@ -238,6 +246,7 @@ class MultiscaleAttention(layers.Layer):
                     padding='VALID',
                     groups=head_dim,
                     use_bias=False,
+                    data_format=data_format,
                     **common_kwargs
                 )
                 if self._kernel_kv is not None
@@ -253,27 +262,34 @@ class MultiscaleAttention(layers.Layer):
         return super().build(input_shape)
 
     def call(self, inputs, patch_shape, *args, **kwargs):
-        _, _, channels = inputs.shape
+        _, length, channels = inputs.shape
 
-        q = self.proj_q(inputs)
-        k = self.proj_k(inputs)
-        v = self.proj_v(inputs)
+        def _reshape_proj(tensor):
+            tensor = tf.reshape(tensor, [-1, length,
+                                         self._num_heads, channels // self._num_heads])
+            return tf.permute(0, 2, 1, 3)
+
+        q = _reshape_proj(self.proj_q(inputs))
+        k = _reshape_proj(self.proj_k(inputs))
+        v = _reshape_proj(self.proj_v(inputs))
 
         q_pool, q_shape = _attention_pooling(q, self.pool_q, patch_shape)
-        k_pool, _ = _attention_pooling(k, self.pool_k, patch_shape)
+        k_pool, k_shape = _attention_pooling(k, self.pool_k, patch_shape)
         v_pool, _ = _attention_pooling(v, self.pool_v, patch_shape)
 
         # Reshape is a hack to pass the patch shape information
-        q_pos = tf.reshape(q_pool, [-1, *patch_shape, channels])
-        pos_rel_embed = self.pos_embed(q_pos)
-        attn = tf.matmul(q_pool, tf.transpose(k_pool, [0, 2, 1]))
-        attn = (attn + pos_rel_embed) * self._scale
-        attn = tf.nn.softmax(attn, axis=-1)
+        k_pool = self.pos_embed(tf.reshape(k_pool, [-1, self._num_heads,
+                                                    *k_shape, k_pool.shape[-1]]))
 
+        attn = tf.matmul(q_pool, tf.transpose(k_pool, perm=[0, 1, 3, 2]))
+        attn = tf.nn.softmax(attn * self._scale, axis=-1)
+
+        # Need to stay consistent q_pool before reshape
         x = tf.matmul(attn, v_pool)
-        x = tf.transpose(x, perm=[0, 2, 1])
-        x = tf.reshape(x, [-1, q_pool.shape[1], channels])
         x = x + q_pool
+
+        x = tf.transpose(x, perm=[0, 2, 1, 3])
+        x = tf.reshape(x, [-1, q_pool.shape[2], channels])
 
         x = self.proj_output(x)
 
