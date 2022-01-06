@@ -1,7 +1,6 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras import layers
-from tensorflow.python.keras import backend
 
 from typing import Callable, Optional, Tuple, List
 
@@ -10,7 +9,7 @@ from tensorflow.python.keras.engine.base_layer import Layer
 from official.vision.beta.modeling.layers.nn_layers import StochasticDepth
 
 
-class RelativePositionEmbedding(layers.Layer):
+class RelativePositionEmbedding(Layer):
     def __init__(self, initializer: object, **kwargs) -> None:
         super().__init__(**kwargs)
         self._initializer = initializer
@@ -112,7 +111,7 @@ def _attention_pooling(
     return tensor, output_patch_shape
 
 
-class MultiscaleAttention(layers.Layer):
+class MultiscaleAttention(Layer):
     def __init__(
             self,
             num_heads: int = 8,
@@ -299,7 +298,7 @@ class MultiscaleAttention(layers.Layer):
         return x, q_shape
 
 
-class MLP(layers.Layer):
+class MLP(Layer):
     def __init__(
             self,
             hidden_dim: Optional[int] = None,
@@ -349,7 +348,7 @@ class MLP(layers.Layer):
         return x
 
 
-class MultiscaleBlock(layers.Layer):
+class MultiscaleBlock(Layer):
     def __init__(self,
                  output_dim: int,
                  num_heads: int,
